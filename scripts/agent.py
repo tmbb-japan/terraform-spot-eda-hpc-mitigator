@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
 """
 AWS EC2 Spot Interruption Mitigation Agent
-Description: Automatically detects Spot instance termination via IMDSv2 
-             and gracefully drains running simulation processes.
+
+IMDSv2를 통해 스팟 중단 알림을 감지하고,
+실행 중인 시뮬레이션 프로세스를 Graceful Drain 처리합니다.
+
+환경 변수:
+  TARGET_PROCESS  - 종료 대상 프로세스 식별자 (기본: simulate.sh)
+  POLL_INTERVAL   - 폴링 주기 초 (기본: 5)
+  BACKUP_DIR      - 백업 확인 경로 (기본: /mnt/efs/backup)
+  DRAIN_TIMEOUT   - 드레인 대기 최대 초 (기본: 90)
 """
 
 import os
@@ -14,125 +21,179 @@ import subprocess
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
+from pathlib import Path
 
-# 로깅 설정 (Standard Output으로 구조화된 로그 출력)
+# ==============================================================================
+# Configuration (환경 변수 기반 설정)
+# ==============================================================================
+TARGET_PROCESS = os.environ.get("TARGET_PROCESS", "simulate.sh")
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
+BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/mnt/efs/backup"))
+DRAIN_TIMEOUT = int(os.environ.get("DRAIN_TIMEOUT", "90"))
+
+# ==============================================================================
+# Logging
+# ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("SpotDetector")
+logger = logging.getLogger("spot-agent")
 
-class SpotInterruptionDetector:
-    IMDS_BASE_URL = "http://169.254.169.254/latest"
-    TOKEN_URL = f"{IMDS_BASE_URL}/api/token"
-    ACTION_URL = f"{IMDS_BASE_URL}/meta-data/spot/instance-action"
-    
-    def __init__(self, target_process="simulate.sh", interval=5, token_ttl=21600):
-        self.target_process = target_process
-        self.interval = interval
-        self.token_ttl = token_ttl
-        
-        self.token = None
-        self.token_expiry = datetime.min
 
-    def _refresh_token(self):
-        """IMDSv2 보안 세션 토큰을 선제적으로 발급 및 갱신합니다."""
-        if datetime.now() < self.token_expiry - timedelta(minutes=1):
+class SpotInterruptionAgent:
+    """IMDSv2 기반 스팟 중단 감지 및 Graceful Drain 에이전트."""
+
+    IMDS_BASE = "http://169.254.169.254/latest"
+    TOKEN_URL = f"{IMDS_BASE}/api/token"
+    ACTION_URL = f"{IMDS_BASE}/meta-data/spot/instance-action"
+    TOKEN_TTL = 21600  # 6시간
+
+    def __init__(self):
+        self._token: str | None = None
+        self._token_expiry: datetime = datetime.min
+        self._running = True
+
+        # 에이전트 자체 시그널 핸들링
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+
+    def _handle_shutdown(self, signum, frame):
+        """에이전트 자체의 정상 종료 처리."""
+        sig_name = signal.Signals(signum).name
+        logger.info(f"에이전트가 {sig_name} 시그널을 수신하여 종료합니다.")
+        self._running = False
+
+    # --------------------------------------------------------------------------
+    # IMDSv2 Token Management
+    # --------------------------------------------------------------------------
+    def _refresh_token(self) -> bool:
+        """만료 1분 전 선제적으로 IMDSv2 세션 토큰을 갱신합니다."""
+        if datetime.now() < self._token_expiry - timedelta(minutes=1):
             return True
 
-        logger.debug("IMDSv2 세션 토큰 갱신 시도 중...")
         req = urllib.request.Request(self.TOKEN_URL, method="PUT")
-        req.add_header("X-aws-ec2-metadata-token-ttl-seconds", str(self.token_ttl))
-        
+        req.add_header("X-aws-ec2-metadata-token-ttl-seconds", str(self.TOKEN_TTL))
+
         try:
-            with urllib.request.urlopen(req, timeout=2) as response:
-                self.token = response.read().decode('utf-8')
-                self.token_expiry = datetime.now() + timedelta(seconds=self.token_ttl)
-                logger.debug("IMDSv2 세션 토큰이 성공적으로 발급되었습니다.")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                self._token = resp.read().decode("utf-8")
+                self._token_expiry = datetime.now() + timedelta(seconds=self.TOKEN_TTL)
                 return True
         except Exception as e:
-            logger.error(f"IMDSv2 토큰 발급 실패 (네트워크 또는 IMDS 미활성화 상태): {e}")
+            logger.error(f"IMDSv2 토큰 갱신 실패: {e}")
             return False
 
-    def send_sigterm_to_target(self):
-        """프로덕션 환경에서 오탐 없이 타겟 프로세스를 정확히 찾아 SIGTERM을 전송합니다."""
+    # --------------------------------------------------------------------------
+    # Process Signal Dispatch
+    # --------------------------------------------------------------------------
+    def _send_sigterm(self) -> list[int]:
+        """타겟 프로세스를 찾아 SIGTERM을 전송합니다. 시그널을 보낸 PID 목록을 반환."""
+        signaled: list[int] = []
         try:
-            cmd = ["pgrep", "-f", f"([^/ ]*/)?{self.target_process}"]
-            pid_bytes = subprocess.check_output(cmd)
-            pids = [int(pid) for pid in pid_bytes.decode('utf-8').strip().split('\n') if pid]
-            
-            my_pid = os.getpid()
-            signaled_count = 0
-
-            for pid in pids:
-                if pid == my_pid:
-                    continue  # 에이전트 자신은 제외
-                
-                logger.info(f"종료 대상 프로세스 포착 -> {self.target_process} (PID: {pid})")
-                os.kill(pid, signal.SIGTERM)
-                logger.info(f"PID [{pid}]번에 SIGTERM(종료 및 드레인) 신호를 전달했습니다.")
-                signaled_count += 1
-                
-            if signaled_count == 0:
-                logger.warning(f"종료 대상 프로세스 목록에는 있었으나 신호를 보낼 실제 프로세스가 없습니다.")
-                
+            result = subprocess.run(
+                ["pgrep", "-f", TARGET_PROCESS],
+                capture_output=True, text=True, check=True
+            )
+            pids = [int(p) for p in result.stdout.strip().split("\n") if p]
         except subprocess.CalledProcessError:
-            logger.warning(f"현재 인스턴스 내에서 활성화된 '{self.target_process}' 프로세스를 찾을 수 없습니다.")
-        except Exception as e:
-            logger.error(f"프로세스 시그널 전송 중 예기치 못한 실패 발생: {e}")
+            logger.warning(f"활성 프로세스 없음: {TARGET_PROCESS}")
+            return signaled
 
-    def start_polling(self):
-        """5초 주기로 IMDSv2 엔드포인트를 감시하는 메인 루프입니다."""
-        logger.info(f"스팟 알림 데몬이 시작되었습니다. (대상: {self.target_process}, 주기: {self.interval}s)")
-        
-        while True:
+        my_pid = os.getpid()
+        for pid in pids:
+            if pid == my_pid:
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+                logger.info(f"SIGTERM → PID {pid}")
+                signaled.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                logger.error(f"PID {pid} 시그널 권한 없음")
+
+        return signaled
+
+    def _wait_for_drain(self, pids: list[int]) -> bool:
+        """대상 프로세스가 종료될 때까지 최대 DRAIN_TIMEOUT초 대기합니다."""
+        deadline = time.time() + DRAIN_TIMEOUT
+        remaining = set(pids)
+
+        while remaining and time.time() < deadline:
+            for pid in list(remaining):
+                try:
+                    os.kill(pid, 0)  # 프로세스 존재 확인 (시그널 전송 안 함)
+                except ProcessLookupError:
+                    remaining.discard(pid)
+                    logger.info(f"PID {pid} 정상 종료 확인")
+            if remaining:
+                time.sleep(1)
+
+        if remaining:
+            logger.warning(f"드레인 타임아웃 — 미종료 PID: {remaining}")
+            return False
+        return True
+
+    # --------------------------------------------------------------------------
+    # Main Polling Loop
+    # --------------------------------------------------------------------------
+    def run(self):
+        """메인 이벤트 루프: IMDSv2 폴링 → 중단 감지 → Graceful Drain."""
+        logger.info(
+            f"스팟 에이전트 시작 | target={TARGET_PROCESS} "
+            f"interval={POLL_INTERVAL}s drain_timeout={DRAIN_TIMEOUT}s"
+        )
+
+        while self._running:
             if not self._refresh_token():
-                # 토큰 갱신 실패 시 다음 루프에서 재시도
-                time.sleep(self.interval)
+                time.sleep(POLL_INTERVAL)
                 continue
 
             req = urllib.request.Request(self.ACTION_URL)
-            req.add_header("X-aws-ec2-metadata-token", self.token)
+            req.add_header("X-aws-ec2-metadata-token", self._token)
 
             try:
-                with urllib.request.urlopen(req, timeout=2) as response:
-                    if response.status == 200:
-                        meta_data = response.read().decode('utf-8')
-                        
-                        logger.critical("🚨 [SPOT INTERRUPTION DETECTED] AWS로부터 스팟 회수 알림을 수신했습니다!")
-                        logger.critical(f"상세 메타데이터 원본: {meta_data}")
-                        logger.info("▶️ [Graceful Drain] 인프라 대피 작업을 가동합니다. 시뮬레이션 강제 정지 시퀀스 진입.")
-                        
-                        # 시뮬레이션 프로세스 중단 처리
-                        self.send_sigterm_to_target()
-                        
-                        logger.info("에이전트 임무 완료. 모니터링 데몬을 종료합니다.")
-                        sys.exit(0)
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    if resp.status == 200:
+                        body = resp.read().decode("utf-8")
+                        logger.critical(f"[SPOT INTERRUPTION] 회수 알림 수신: {body}")
+
+                        # Phase 1: 시뮬레이션 프로세스 종료 요청
+                        pids = self._send_sigterm()
+
+                        # Phase 2: 프로세스 종료 대기 (백업 완료 보장)
+                        if pids:
+                            self._wait_for_drain(pids)
+
+                        # Phase 3: 백업 파일 존재 확인
+                        if BACKUP_DIR.exists() and any(BACKUP_DIR.iterdir()):
+                            logger.info(f"백업 확인 완료: {BACKUP_DIR}")
+                        else:
+                            logger.warning(f"백업 디렉토리 비어있음: {BACKUP_DIR}")
+
+                        logger.info("드레인 시퀀스 완료. 에이전트 종료.")
+                        return
 
             except urllib.error.HTTPError as e:
                 if e.code == 404:
-                    # 평상시 상태: 중단 알림이 없는 경우 AWS가 404를 반환하는 것이 정상 스펙
-                    pass
+                    pass  # 정상: 중단 알림 없음
                 elif e.code == 401:
-                    logger.warning("인증 토큰이 만료되었거나 무효화되었습니다. 다음 루프에서 즉시 갱신합니다.")
-                    self.token_expiry = datetime.min
+                    logger.warning("토큰 만료 감지 — 다음 루프에서 갱신")
+                    self._token_expiry = datetime.min
                 else:
-                    logger.error(f"IMDSv2 통신 중 예외적 HTTP 에러 발생 (Status Code: {e.code})")
+                    logger.error(f"IMDS HTTP 에러: {e.code}")
             except urllib.error.URLError as e:
-                logger.error(f"IMDSv2 서버와 통신할 수 없습니다 (네트워크 타임아웃 또는 미연결): {e.reason}")
+                logger.error(f"IMDS 연결 불가: {e.reason}")
             except Exception as e:
-                logger.error(f"시스템 예외 발생: {e}")
+                logger.error(f"예외 발생: {e}")
 
-            time.sleep(self.interval)
+            time.sleep(POLL_INTERVAL)
+
+        logger.info("에이전트 정상 종료.")
+
 
 if __name__ == "__main__":
-    try:
-        detector = SpotInterruptionDetector(target_process="simulate.sh", interval=5)
-        detector.start_polling()
-    except KeyboardInterrupt:
-        logger.info("사용자 요청(SIGINT)에 의해 모니터 데몬이 안전하게 정지되었습니다.")
-        sys.exit(0)
-    except Exception as fatal_err:
-        logger.critical(f"에이전트가 예기치 못한 치명적 오류로 다운되었습니다: {fatal_err}")
-        sys.exit(1)
+    agent = SpotInterruptionAgent()
+    agent.run()

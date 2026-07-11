@@ -1,56 +1,71 @@
 #!/bin/bash
+set -uo pipefail
+# ==============================================================================
+# EDA HPC Simulation Worker
+# - 무한 루프 연산을 수행하며 주기적으로 진행 상태를 기록
+# - SIGTERM 수신 시 현재 상태를 EFS로 백업하고 정상 종료
+# ==============================================================================
 
-# ==========================================
-# 설정 변수
-# ==========================================
-PROGRESS_FILE="progress.txt"
-BACKUP_DIR="/mnt/efs/backup"
+# Configuration
+readonly WORK_DIR="/opt/eda-hpc"
+readonly PROGRESS_FILE="${WORK_DIR}/progress.txt"
+readonly BACKUP_DIR="/mnt/efs/backup"
+readonly PID_FILE="${WORK_DIR}/simulate.pid"
+
 CURRENT_SUM=0
 CURRENT_NUM=1
 
-# ==========================================
-# SIGTERM 핸들러 (백업 및 종료 로직)
-# ==========================================
+# ==============================================================================
+# SIGTERM Handler: 상태 백업 후 정상 종료
+# ==============================================================================
 handle_sigterm() {
-    echo ""
-    echo "[WARN] SIGTERM 신호를 수신했습니다. 연산을 중지합니다..."
-    
-    # 백업 디렉토리가 존재하지 않으면 생성
+    echo "[$(date '+%F %T')] [DRAIN] SIGTERM 수신 — 백업 시작"
+
     mkdir -p "${BACKUP_DIR}"
-    
-    # 타임스탬프 생성
-    TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-    BACKUP_FILE="${BACKUP_DIR}/progress_${TIMESTAMP}.txt"
-    
-    # EFS 마운트 경로로 progress.txt 및 타임스탬프 덤프(Dump)
+
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    local backup_file="${BACKUP_DIR}/progress_${timestamp}.txt"
+
     {
-        echo "=== 스팟 인스턴스 중단에 의한 백업 ==="
-        echo "백업 시간: $(date)"
-        echo "마지막 상태:"
-        cat "${PROGRESS_FILE}"
-    } > "${BACKUP_FILE}"
-    
-    echo "[INFO] 상태 및 타임스탬프가 안전하게 저장되었습니다: ${BACKUP_FILE}"
-    echo "[INFO] 프로세스를 종료합니다."
+        echo "backup_time=$(date --iso-8601=seconds 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')"
+        echo "reason=spot_interruption"
+        echo "current_number=${CURRENT_NUM}"
+        echo "current_sum=${CURRENT_SUM}"
+        echo "pid=$$"
+        echo "hostname=$(hostname)"
+    } > "${backup_file}"
+
+    # 마지막 progress 파일도 백업
+    if [[ -f "${PROGRESS_FILE}" ]]; then
+        cp "${PROGRESS_FILE}" "${BACKUP_DIR}/last_progress.txt"
+    fi
+
+    echo "[$(date '+%F %T')] [DRAIN] 백업 완료: ${backup_file}"
+    rm -f "${PID_FILE}"
     exit 0
 }
 
-# 에이전트로부터 SIGTERM(15) 수신 시 handle_sigterm 함수 실행
 trap 'handle_sigterm' SIGTERM
 
-# ==========================================
-# 메인 시뮬레이션 루프
-# ==========================================
-echo "[INFO] 시뮬레이션을 시작합니다. (PID: $$)"
-echo "Current Number: 0 | Current Sum: 0" > "${PROGRESS_FILE}"
+# ==============================================================================
+# 초기화
+# ==============================================================================
+mkdir -p "${WORK_DIR}"
+echo $$ > "${PID_FILE}"
+echo "[$(date '+%F %T')] [START] 시뮬레이션 시작 (PID: $$)"
+echo "num=${CURRENT_NUM} sum=${CURRENT_SUM}" > "${PROGRESS_FILE}"
 
+# ==============================================================================
+# Main Loop: 누적합 연산 시뮬레이션
+# ==============================================================================
 while true; do
     CURRENT_SUM=$((CURRENT_SUM + CURRENT_NUM))
-    
-    # 디스크 I/O 병목 현상을 방지하기 위해 10만 번 연산마다 파일에 기록
+
+    # 디스크 I/O 부하 방지: 10만 반복마다 상태 기록
     if (( CURRENT_NUM % 100000 == 0 )); then
-        echo "Current Number: ${CURRENT_NUM} | Current Sum: ${CURRENT_SUM}" > "${PROGRESS_FILE}"
+        echo "num=${CURRENT_NUM} sum=${CURRENT_SUM}" > "${PROGRESS_FILE}"
     fi
-    
+
     CURRENT_NUM=$((CURRENT_NUM + 1))
 done
