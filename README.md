@@ -1,52 +1,162 @@
 # terraform-spot-eda-hpc-mitigator
 
-반도체 EDA(설계) 및 HPC(고성능 연산) 환경의 비용 최적화를 위한 **AWS 스팟 인스턴스 자동 중단 완화(Mitigation) 인프라 템플릿**입니다. 
+> AWS Spot 인스턴스 중단 자동 대응 시스템 — 반도체 EDA/HPC 시뮬레이션 워크로드용
 
-AWS의 스팟 회수 경고(2분 전 알림)를 감지하여 실행 중인 시뮬레이션의 상태(State)를 네트워크 스토리지(EFS)에 안전하게 백업하고, 작업 유실을 최소화하는 CLI 기반의 IaC 패키지입니다.
+## Overview
+
+반도체 설계(EDA) 시뮬레이션을 AWS Spot 인스턴스에서 운용할 때, 서버 회수(2분 전 사전 경고)를 자동 감지하여 **실행 중인 연산 결과를 네트워크 저장소(EFS)에 안전하게 보존**하는 인프라 자동화 시스템입니다.
+
+### 배경: Spot 인스턴스란?
+
+| 구분       | 일반 서버 (On-Demand) | Spot 인스턴스                           |
+| ---------- | --------------------- | --------------------------------------- |
+| **비용**   | 정가 100%             | 정가 대비 60~90% 할인                   |
+| **가용성** | 항시 유지             | AWS가 **2분 전 경고 후 강제 회수** 가능 |
+
+Spot은 비용 효율이 높지만, 회수 시점에 대비하지 않으면 수시간~수일 분량의 시뮬레이션 결과가 유실됩니다. 이 시스템은 그 2분 내에 상태를 자동 보존합니다.
 
 ---
 
-## 🏗️ 시스템 아키텍처 (Architecture)
+## Architecture
 
-1. **IaC (Terraform):** VPC, Security Group, EFS(Amazon Elastic File System), EC2 스팟 인스턴스를 코드 한 줄로 프로비저닝합니다.
-2. **Simulation Worker:** 인스턴스 생성 시 `user_data`를 통해 가상의 대용량 시뮬레이션 파이프라인(Bash 루프)이 백그라운드에서 자동 실행됩니다.
-3. **Mitigation Agent (Python):** IMDSv2(인스턴스 메타데이터 서비스)를 5초 주기로 폴링하며 스팟 회수 경고(`instance-action`)를 감시합니다.
-4. **Backup & Drain:** 경고 감시 즉시 시뮬레이션 프로세스에 종료 시그널을 보내 작업을 안전하게 안전 자산(EFS 마운트 경로)으로 백업(Dump)하고 프로세스를 종료합니다.
+```mermaid
+flowchart TB
+    subgraph AWS["AWS Cloud"]
+        direction TB
 
----
+        subgraph VPC["VPC (Private Network)"]
+            direction LR
 
-## 🚀 빠른 시작 (Quick Start)
+            subgraph EC2["EC2 Spot Instance"]
+                SIM["simulate.sh<br/>시뮬레이션 실행"]
+                AGENT["agent.py<br/>중단 감시 데몬"]
+            end
 
-### 1. 사전 요구사항
-* AWS CLI 자격 증명(Credentials) 설정 완료
-* Terraform CLI 설치 완료
+            EFS[("EFS<br/>공유 저장소<br/>(서버 회수 후에도 유지)")]
+        end
 
-### 2. 인프라 배포 및 실행
-```bash
-git clone https://github.com/YOUR_ACCOUNT/terraform-spot-eda-hpc-mitigator.git
-cd terraform-spot-eda-hpc-mitigator
-terraform init
-terraform apply -auto-approve
+        SPOT_SVC(["AWS Spot Service<br/>회수 알림 발송"])
+        CW["CloudWatch Logs"]
+    end
+
+    SPOT_SVC -. "① 2분 전 회수 경고" .-> AGENT
+    AGENT -- "② SIGTERM (안전 종료 신호)" --> SIM
+    SIM -- "③ 연산 상태 백업" --> EFS
+    AGENT -- "이벤트 로그" --> CW
+
+    style SPOT_SVC fill:#e03131,color:#fff
+    style EFS fill:#2f9e44,color:#fff
+    style AGENT fill:#1971c2,color:#fff
+    style SIM fill:#e8590c,color:#fff
+```
+
+### 처리 흐름
+
+```
+AWS 회수 경고 발생 → agent.py 감지 (5초 주기 폴링)
+→ simulate.sh에 종료 신호 전송 → 현재 연산 상태를 EFS에 저장
+→ 프로세스 정상 종료 → 서버 회수되어도 데이터 무손실
 ```
 
 ---
 
-## ⚠️ 현업 적용 시 고려사항 (Production Considerations for Semiconductor Enterprise)
+## Project Structure
 
-본 저장소는 스팟 중단 대응 흐름을 설명하기 위한 MVP로, 경량 워크로드 기준에서는 2분 내 상태 백업이 가능합니다. 다만 기업의 실제 EDA 결과물(수십~수백 GB)은 같은 방식으로는 2분 안에 EFS로 완전 전송하기 어렵기 때문에, 아래와 같은 프로덕션 확장이 필요합니다.
+```
+.
+├── main.tf                 # 인프라 정의 (네트워크, 보안, 저장소, 서버)
+├── variables.tf            # 배포 설정값 (서버 사양, 리전, 보안 등)
+├── outputs.tf              # 배포 결과 출력 (서버 IP, 저장소 ID 등)
+├── .gitignore
+└── scripts/
+    ├── user_data.sh        # 서버 기동 시 자동 실행되는 초기화 스크립트
+    ├── agent.py            # Spot 회수 감시 데몬 (IMDSv2 기반)
+    └── simulate.sh         # 시뮬레이션 워커 (SIGTERM 수신 시 상태 백업)
+```
 
-### 1) 2분의 벽: 백업 중심에서 체크포인트 중심으로
+---
 
-* **한계:** 스팟 중단 알림 후 남은 2분은 대용량 산출물 전체를 네트워크 스토리지로 이동하기에 물리적으로 부족할 수 있습니다.
-* **권장 전략:** 인프라 레이어와 애플리케이션 레이어에서 **주기적 체크포인팅(Checkpointing) + 스냅샷**을 병행합니다.
-* **운영 방식:** 중단 알림 시점에는 전체 덤프가 아니라 마지막 체크포인트 메타데이터 동기화와 작업 안전 종료(Graceful Shutdown)에 집중합니다.
+## Quick Start
 
-### 2) HPC 스케줄러 연동: 단일 노드 감지에서 클러스터 오케스트레이션으로
+### Prerequisites
 
-* **한계:** 단일 스크립트 기반 감지는 대규모 HPC 운영(예: 키옥시아급 반도체 환경)에 충분하지 않습니다.
-* **권장 전략:** IBM LSF 또는 Slurm과 연동하여 스팟 중단 이벤트를 **클러스터 단위 제어 신호**로 처리합니다.
-* **확장 시나리오:**
-	1. 중단 알림 수신
-	2. 스케줄러 API로 해당 노드를 즉시 Drain 처리
-	3. 대기/실행 중 작업을 On-Demand 또는 가용 Spot 노드로 Re-queue
-	4. 체크포인트 기준으로 작업 재개
+- AWS CLI 인증 설정 완료 (`aws configure`)
+- Terraform >= 1.5.0
+
+### Deploy
+
+```bash
+git clone https://github.com/YOUR_ACCOUNT/terraform-spot-eda-hpc-mitigator.git
+cd terraform-spot-eda-hpc-mitigator
+
+# 환경별 설정 (본인 환경에 맞게 수정)
+cat > terraform.tfvars <<EOF
+environment       = "dev"
+instance_type     = "c5.large"
+allowed_ssh_cidrs = ["본인_IP/32"]
+key_pair_name     = "본인_키페어_이름"
+EOF
+
+terraform init
+terraform plan       # 생성될 자원 미리보기
+terraform apply      # 인프라 생성 실행
+```
+
+### Verify
+
+```bash
+terraform output spot_instance_public_ip
+terraform output efs_id
+```
+
+### Destroy
+
+```bash
+terraform destroy    # 모든 자원 삭제 (비용 발생 방지)
+```
+
+---
+
+## Variables
+
+| Name                | Default          | Description                                      |
+| ------------------- | ---------------- | ------------------------------------------------ |
+| `aws_region`        | `ap-northeast-2` | 배포 리전 (서울)                                 |
+| `instance_type`     | `c5.large`       | 서버 사양 (2 vCPU / 4GB RAM)                     |
+| `project_name`      | `eda-hpc`        | 리소스 네이밍 접두사                             |
+| `environment`       | `dev`            | 환경 구분 (`dev` / `staging` / `prod`)           |
+| `allowed_ssh_cidrs` | `[]`             | SSH 접근 허용 IP 대역 (미지정 시 SSH 비활성)     |
+| `spot_max_price`    | `""`             | Spot 최대 입찰가 (미지정 시 On-Demand 가격 상한) |
+| `key_pair_name`     | `""`             | EC2 접속용 SSH Key Pair                          |
+
+---
+
+## Security
+
+| 항목            | 적용 내용                                              |
+| --------------- | ------------------------------------------------------ |
+| 네트워크 접근   | SSH CIDR 미지정 시 인바운드 규칙 자체 미생성           |
+| 메타데이터 보호 | IMDSv2 강제 (`http_tokens = required`)                 |
+| 저장소 암호화   | EFS 저장 시 암호화 + 전송 구간 TLS                     |
+| 권한 관리       | IAM 최소 권한 (EFS 접근 + CloudWatch 로그 전송만 허용) |
+| 보안 그룹       | EFS는 워커 서버로부터의 NFS 트래픽만 수신 허용         |
+
+---
+
+## Production 확장 가이드
+
+본 프로젝트는 **PoC(개념 검증)** 용도입니다. EDA 환경 적용 시 아래 확장이 필요합니다.
+
+### 1) 대용량 산출물 대응 — 주기적 Checkpoint
+
+| 현재 (PoC)                          | Production 확장                               |
+| ----------------------------------- | --------------------------------------------- |
+| 회수 시점에 전체 상태를 한번에 백업 | 시뮬레이션 중 **N분 간격으로 자동 중간 저장** |
+| 소용량 데이터만 2분 내 처리 가능    | 회수 시에는 마지막 중간 저장 이후 증분만 처리 |
+
+### 2) 클러스터 규모 운용 — 스케줄러 연동
+
+수십~수백 대 규모의 HPC 클러스터(LSF / Slurm)에서 운용 시:
+
+- 회수 대상 서버를 스케줄러에서 즉시 Drain 처리
+- 해당 작업을 잔여 서버로 자동 재배치, 중간 저장 지점부터 재개
