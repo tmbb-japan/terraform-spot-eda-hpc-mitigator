@@ -45,8 +45,8 @@ flowchart TB
     AGENT -- "② SIGTERM (안전 종료 신호)" --> SIM
     SIM -- "③ 연산 상태 백업" --> EFS
 
-    ASG -. "④ 회수 후<br/>인스턴스 자동 복구" .-> EFS
-    SIM -. "⑤ 체크포인트 복원" .-> EFS
+    SIM -. "④ 체크포인트 복원" .-> EFS
+    ASG -. "⑤ 회수 후<br/>인스턴스 자동 복구" .-> EFS
     AGENT -- "이벤트 로그" --> CW
 
     style SPOT_SVC fill:#e03131,color:#fff
@@ -62,8 +62,8 @@ flowchart TB
 AWS 회수 경고 발생 → agent.py 감지 (5초 주기 폴링)
 → simulate.sh에 종료 신호 전송 → 현재 연산 상태를 EFS에 저장
 → 프로세스 정상 종료 → 서버 회수
-→ ASG가 새 스팟 인스턴스 자동 생성 (멀티 AZ)
 → simulate.sh가 EFS 백업에서 체크포인트 복원 → 이어서 계산
+→ ASG가 새 스팟 인스턴스 자동 생성 (멀티 AZ)
 ```
 
 ---
