@@ -44,10 +44,10 @@ flowchart TB
     SPOT_SVC -. "① 2분 전 회수 경고" .-> AGENT
     AGENT -- "② SIGTERM (안전 종료 신호)" --> SIM
     SIM -- "③ 연산 상태 백업" --> EFS
-    SIM -. "⑤ 체크포인트 복원" .-> EFS
-    AGENT -- "이벤트 로그" --> CW
 
     ASG -. "④ 회수 후<br/>인스턴스 자동 복구" .-> EFS
+    SIM -. "⑤ 체크포인트 복원" .-> EFS
+    AGENT -- "이벤트 로그" --> CW
 
     style SPOT_SVC fill:#e03131,color:#fff
     style EFS fill:#2f9e44,color:#fff
