@@ -27,9 +27,11 @@ flowchart TB
         subgraph VPC["VPC (Private Network)"]
             direction LR
 
-            subgraph EC2["EC2 Spot Instance"]
-                SIM["simulate.sh<br/>시뮬레이션 실행"]
-                AGENT["agent.py<br/>중단 감시 데몬"]
+            subgraph ASG["Auto Scaling Group (min=1, max=1)"]
+                subgraph EC2["EC2 Spot Instance"]
+                    SIM["simulate.sh<br/>시뮬레이션 실행"]
+                    AGENT["agent.py<br/>중단 감시 데몬"]
+                end
             end
 
             EFS[("EFS<br/>공유 저장소<br/>(서버 회수 후에도 유지)")]
@@ -42,12 +44,15 @@ flowchart TB
     SPOT_SVC -. "① 2분 전 회수 경고" .-> AGENT
     AGENT -- "② SIGTERM (안전 종료 신호)" --> SIM
     SIM -- "③ 연산 상태 백업" --> EFS
+    ASG -. "④ 인스턴스 자동 복구" .-> EC2
+    SIM -. "⑤ 체크포인트 복원" .-> EFS
     AGENT -- "이벤트 로그" --> CW
 
     style SPOT_SVC fill:#e03131,color:#fff
     style EFS fill:#2f9e44,color:#fff
     style AGENT fill:#1971c2,color:#fff
     style SIM fill:#e8590c,color:#fff
+    style ASG fill:#7048e8,color:#fff
 ```
 
 ### 처리 흐름
@@ -55,7 +60,9 @@ flowchart TB
 ```
 AWS 회수 경고 발생 → agent.py 감지 (5초 주기 폴링)
 → simulate.sh에 종료 신호 전송 → 현재 연산 상태를 EFS에 저장
-→ 프로세스 정상 종료 → 서버 회수되어도 데이터 무손실
+→ 프로세스 정상 종료 → 서버 회수
+→ ASG가 새 스팟 인스턴스 자동 생성 (멀티 AZ)
+→ simulate.sh가 EFS 백업에서 체크포인트 복원 → 이어서 계산
 ```
 
 ---
@@ -106,8 +113,15 @@ terraform apply      # 인프라 생성 실행
 ### Verify
 
 ```bash
-terraform output spot_instance_public_ip
+terraform output asg_name
 terraform output efs_id
+terraform output subnet_azs
+
+# 현재 실행 중인 인스턴스 IP 확인 (ASG가 관리하므로 AWS CLI로 조회)
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=$(terraform output -raw asg_name | sed 's/-asg/-spot-worker/')" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].PublicIpAddress' --output text
 ```
 
 ### Destroy
@@ -163,7 +177,13 @@ terraform destroy    # 모든 자원 삭제 (비용 발생 방지)
 **1) 인스턴스 접속**
 
 ```bash
-ssh -i ~/.ssh/YOUR_KEY.pem ec2-user@$(terraform output -raw spot_instance_public_ip)
+# ASG 인스턴스의 퍼블릭 IP 조회 후 접속
+INSTANCE_IP=$(aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=eda-hpc-dev-spot-worker" \
+            "Name=instance-state-name,Values=running" \
+  --query 'Reservations[].Instances[].PublicIpAddress' --output text)
+
+ssh -i ~/.ssh/YOUR_KEY.pem ec2-user@$INSTANCE_IP
 ```
 
 **2) 프리플라이트 체크 (Dry Run)**
@@ -214,6 +234,31 @@ sudo bash /opt/eda-hpc/manual_drain.sh --restart --force
 
 ---
 
+## 자동 복구 & 체크포인트
+
+### 스팟 회수 후 자동 복구 (ASG)
+
+Auto Scaling Group이 인스턴스를 항상 1대 유지합니다. 회수되면 멀티 AZ 중 스팟 용량이 있는 곳에서 자동으로 새 인스턴스가 올라옵니다.
+
+```
+회수 전: ap-northeast-2a에서 실행 중
+    ↓ (스팟 회수)
+회수 후: ASG가 2a / 2b / 2c 중 가용한 AZ에서 자동 생성
+    ↓
+새 인스턴스: EFS 마운트 → 체크포인트 복원 → 시뮬레이션 재개
+```
+
+### 체크포인트 복원 (simulate.sh)
+
+`simulate.sh`는 시작 시 `/mnt/efs/backup/`에서 가장 최근 백업 파일을 찾아 `current_number`와 `current_sum`을 복원합니다. 복원할 백업이 없으면 처음부터 시작합니다.
+
+```
+[2026-07-12 18:00:01] [RESTORE] 체크포인트 복원 완료: num=5400001 sum=14580002700000 (from: progress_20260712_175823.txt)
+[2026-07-12 18:00:01] [START] 시뮬레이션 시작 (PID: 1234, num=5400001, sum=14580002700000)
+```
+
+---
+
 ## Production 확장 가이드
 
 본 프로젝트는 **PoC(개념 검증)** 용도입니다. EDA 환경 적용 시 아래 확장이 필요합니다.
@@ -231,3 +276,7 @@ sudo bash /opt/eda-hpc/manual_drain.sh --restart --force
 
 - 회수 대상 서버를 스케줄러에서 즉시 Drain 처리
 - 해당 작업을 잔여 서버로 자동 재배치, 중간 저장 지점부터 재개
+
+### 3) 인스턴스 다양화 — Spot Fleet / Mixed Instances
+
+ASG의 Mixed Instances Policy로 여러 인스턴스 타입(c5.large, c5a.large, c6i.large 등)을 후보로 지정하면 특정 타입의 용량 부족 시에도 대체 타입으로 할당받을 수 있습니다.
