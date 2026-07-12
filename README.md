@@ -44,9 +44,10 @@ flowchart TB
     SPOT_SVC -. "① 2분 전 회수 경고" .-> AGENT
     AGENT -- "② SIGTERM (안전 종료 신호)" --> SIM
     SIM -- "③ 연산 상태 백업" --> EFS
-    ASG -. "④ 인스턴스 자동 복구" .-> EC2
     SIM -. "⑤ 체크포인트 복원" .-> EFS
     AGENT -- "이벤트 로그" --> CW
+
+    ASG -. "④ 회수 후<br/>인스턴스 자동 복구" .-> EFS
 
     style SPOT_SVC fill:#e03131,color:#fff
     style EFS fill:#2f9e44,color:#fff
@@ -129,32 +130,6 @@ aws ec2 describe-instances \
 ```bash
 terraform destroy    # 모든 자원 삭제 (비용 발생 방지)
 ```
-
----
-
-## Variables
-
-| Name                | Default          | Description                                      |
-| ------------------- | ---------------- | ------------------------------------------------ |
-| `aws_region`        | `ap-northeast-2` | 배포 리전 (서울)                                 |
-| `instance_type`     | `c5.large`       | 서버 사양 (2 vCPU / 4GB RAM)                     |
-| `project_name`      | `eda-hpc`        | 리소스 네이밍 접두사                             |
-| `environment`       | `dev`            | 환경 구분 (`dev` / `staging` / `prod`)           |
-| `allowed_ssh_cidrs` | `[]`             | SSH 접근 허용 IP 대역 (미지정 시 SSH 비활성)     |
-| `spot_max_price`    | `""`             | Spot 최대 입찰가 (미지정 시 On-Demand 가격 상한) |
-| `key_pair_name`     | `""`             | EC2 접속용 SSH Key Pair                          |
-
----
-
-## Security
-
-| 항목            | 적용 내용                                              |
-| --------------- | ------------------------------------------------------ |
-| 네트워크 접근   | SSH CIDR 미지정 시 인바운드 규칙 자체 미생성           |
-| 메타데이터 보호 | IMDSv2 강제 (`http_tokens = required`)                 |
-| 저장소 암호화   | EFS 저장 시 암호화 + 전송 구간 TLS                     |
-| 권한 관리       | IAM 최소 권한 (EFS 접근 + CloudWatch 로그 전송만 허용) |
-| 보안 그룹       | EFS는 워커 서버로부터의 NFS 트래픽만 수신 허용         |
 
 ---
 
@@ -276,7 +251,3 @@ Auto Scaling Group이 인스턴스를 항상 1대 유지합니다. 회수되면 
 
 - 회수 대상 서버를 스케줄러에서 즉시 Drain 처리
 - 해당 작업을 잔여 서버로 자동 재배치, 중간 저장 지점부터 재개
-
-### 3) 인스턴스 다양화 — Spot Fleet / Mixed Instances
-
-ASG의 Mixed Instances Policy로 여러 인스턴스 타입(c5.large, c5a.large, c6i.large 등)을 후보로 지정하면 특정 타입의 용량 부족 시에도 대체 타입으로 할당받을 수 있습니다.
