@@ -71,7 +71,8 @@ AWS 회수 경고 발생 → agent.py 감지 (5초 주기 폴링)
 └── scripts/
     ├── user_data.sh        # 서버 기동 시 자동 실행되는 초기화 스크립트
     ├── agent.py            # Spot 회수 감시 데몬 (IMDSv2 기반)
-    └── simulate.sh         # 시뮬레이션 워커 (SIGTERM 수신 시 상태 백업)
+    ├── simulate.sh         # 시뮬레이션 워커 (SIGTERM 수신 시 상태 백업)
+    └── manual_drain.sh     # 수동 드레인 테스트 (백업 파이프라인 E2E 검증)
 ```
 
 ---
@@ -140,6 +141,76 @@ terraform destroy    # 모든 자원 삭제 (비용 발생 방지)
 | 저장소 암호화   | EFS 저장 시 암호화 + 전송 구간 TLS                     |
 | 권한 관리       | IAM 최소 권한 (EFS 접근 + CloudWatch 로그 전송만 허용) |
 | 보안 그룹       | EFS는 워커 서버로부터의 NFS 트래픽만 수신 허용         |
+
+---
+
+## Manual Drain Test
+
+`manual_drain.sh`를 사용하면 **실제 Spot 회수 없이** 드레인 → 백업 파이프라인을 수동으로 검증할 수 있습니다.
+
+### 스크립트 옵션
+
+| 옵션                | 설명                                       |
+| ------------------- | ------------------------------------------ |
+| `-d, --dry-run`     | 실제 SIGTERM 없이 프리플라이트 체크만 수행 |
+| `-t, --timeout SEC` | 드레인 대기 시간 (기본: 30초)              |
+| `-r, --restart`     | 드레인 후 simulate.sh를 자동 재시작        |
+| `-f, --force`       | 확인 프롬프트 건너뛰기 (CI/자동화용)       |
+| `-h, --help`        | 도움말                                     |
+
+### 검증 절차
+
+**1) 인스턴스 접속**
+
+```bash
+ssh -i ~/.ssh/YOUR_KEY.pem ec2-user@$(terraform output -raw spot_instance_public_ip)
+```
+
+**2) 프리플라이트 체크 (Dry Run)**
+
+SIGTERM을 보내기 전에 프로세스·EFS·백업 디렉토리 상태를 먼저 확인합니다.
+
+```bash
+sudo bash /opt/eda-hpc/manual_drain.sh --dry-run
+```
+
+정상 출력 예시:
+
+```
+▶ Phase 0 — Pre-flight Checks
+[OK]    PID 파일 존재 (/opt/eda-hpc/simulate.pid)
+[OK]    프로세스 활성 (PID 1234)
+[OK]    백업 디렉토리 쓰기 가능 (/mnt/efs/backup)
+[OK]    EFS 마운트 (/mnt/efs)
+[INFO]  프리플라이트: 4/4 통과
+[INFO]  드라이런 모드 — 실제 드레인을 수행하지 않습니다.
+```
+
+**3) 수동 드레인 실행**
+
+```bash
+sudo bash /opt/eda-hpc/manual_drain.sh
+```
+
+실행하면 현재 시뮬레이션 상태를 보여준 뒤 확인을 요청합니다. `y`를 입력하면 SIGTERM → 종료 대기 → 백업 검증이 순서대로 진행됩니다.
+
+**4) 드레인 + 자동 재시작 (연속 테스트용)**
+
+```bash
+sudo bash /opt/eda-hpc/manual_drain.sh --restart --force
+```
+
+드레인 후 simulate.sh를 자동으로 다시 기동하므로, 반복 테스트 시 유용합니다.
+
+### 검증 항목
+
+| 단계    | 확인 내용                                     | PASS 기준                  |
+| ------- | --------------------------------------------- | -------------------------- |
+| Phase 0 | PID 파일, 프로세스, 백업 디렉토리, EFS 마운트 | 전체 통과                  |
+| Phase 1 | 현재 시뮬레이션 상태 확인 + 사용자 승인       | `y` 입력 (--force 시 스킵) |
+| Phase 2 | SIGTERM 전송 후 프로세스 종료                 | DRAIN_TIMEOUT 내 종료      |
+| Phase 3 | `/mnt/efs/backup/` 에 새 백업 파일 생성       | 파일 수 증가 + 내용 정상   |
+| Phase 4 | (--restart 시) simulate.sh 재기동             | 새 PID로 프로세스 활성     |
 
 ---
 

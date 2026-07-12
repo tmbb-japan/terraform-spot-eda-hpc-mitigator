@@ -58,7 +58,11 @@ cat > "$WORK_DIR/agent.py" << 'AGENT_EOF'
 ${agent_script}
 AGENT_EOF
 
-chmod +x "$WORK_DIR/simulate.sh"
+cat > "$WORK_DIR/manual_drain.sh" << 'DRAIN_EOF'
+${manual_drain_script}
+DRAIN_EOF
+
+chmod +x "$WORK_DIR/simulate.sh" "$WORK_DIR/manual_drain.sh"
 chown -R ec2-user:ec2-user "$WORK_DIR"
 
 # ------------------------------------------------------------------------------

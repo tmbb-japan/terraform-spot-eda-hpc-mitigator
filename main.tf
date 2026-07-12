@@ -262,8 +262,9 @@ resource "aws_spot_instance_request" "worker" {
     efs_id          = aws_efs_file_system.shared_storage.id
     log_group       = aws_cloudwatch_log_group.agent.name
     project_name    = var.project_name
-    simulate_script = file("${path.module}/scripts/simulate.sh")
-    agent_script    = file("${path.module}/scripts/agent.py")
+    simulate_script     = file("${path.module}/scripts/simulate.sh")
+    agent_script        = file("${path.module}/scripts/agent.py")
+    manual_drain_script = file("${path.module}/scripts/manual_drain.sh")
   }))
 
   tags = { Name = "${local.name_prefix}-spot-worker" }
