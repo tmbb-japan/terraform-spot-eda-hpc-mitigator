@@ -31,13 +31,63 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5"))
 BACKUP_DIR = Path(os.environ.get("BACKUP_DIR", "/mnt/efs/backup"))
 DRAIN_TIMEOUT = int(os.environ.get("DRAIN_TIMEOUT", "90"))
 
+# CloudWatch Logs 설정
+CW_LOG_GROUP = os.environ.get("CW_LOG_GROUP", "")
+CW_LOG_STREAM = os.environ.get("CW_LOG_STREAM", "")
+
+# ==============================================================================
+# CloudWatch Logs Handler
+# ==============================================================================
+class CloudWatchLogsHandler(logging.Handler):
+    """boto3를 사용하여 CloudWatch Logs에 로그를 직접 전송하는 핸들러."""
+
+    def __init__(self, log_group: str, log_stream: str):
+        super().__init__()
+        import boto3
+        self._client = boto3.client("logs")
+        self._log_group = log_group
+        self._log_stream = log_stream
+        self._create_log_stream()
+
+    def _create_log_stream(self):
+        try:
+            self._client.create_log_stream(
+                logGroupName=self._log_group,
+                logStreamName=self._log_stream,
+            )
+        except self._client.exceptions.ResourceAlreadyExistsException:
+            pass
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            self._client.put_log_events(
+                logGroupName=self._log_group,
+                logStreamName=self._log_stream,
+                logEvents=[{
+                    "timestamp": int(record.created * 1000),
+                    "message": self.format(record),
+                }],
+            )
+        except Exception:
+            pass  # CloudWatch 전송 실패가 에이전트 동작에 영향을 주지 않도록 무시
+
+
 # ==============================================================================
 # Logging
 # ==============================================================================
+_log_handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+
+if CW_LOG_GROUP and CW_LOG_STREAM:
+    try:
+        _log_handlers.append(CloudWatchLogsHandler(CW_LOG_GROUP, CW_LOG_STREAM))
+    except Exception as e:
+        print(f"CloudWatch Logs 핸들러 초기화 실패 (stdout 전용 모드): {e}",
+              file=sys.stderr)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    handlers=_log_handlers,
 )
 logger = logging.getLogger("spot-agent")
 

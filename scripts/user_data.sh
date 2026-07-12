@@ -16,7 +16,8 @@ log "부트스트랩 시작"
 # ------------------------------------------------------------------------------
 # 1. 패키지 설치
 # ------------------------------------------------------------------------------
-dnf install -y amazon-efs-utils python3 git
+dnf install -y amazon-efs-utils python3 python3-pip git
+pip3 install boto3
 
 # ------------------------------------------------------------------------------
 # 2. EFS 마운트
@@ -66,12 +67,23 @@ chmod +x "$WORK_DIR/simulate.sh" "$WORK_DIR/manual_drain.sh"
 chown -R ec2-user:ec2-user "$WORK_DIR"
 
 # ------------------------------------------------------------------------------
-# 4. 시뮬레이션 및 에이전트 실행
+# 4. 인스턴스 메타데이터 조회 (로그 스트림 식별용)
+# ------------------------------------------------------------------------------
+IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)
+
+log "인스턴스 ID: $INSTANCE_ID"
+
+# ------------------------------------------------------------------------------
+# 5. 시뮬레이션 및 에이전트 실행
 # ------------------------------------------------------------------------------
 su - ec2-user -c "
   cd $WORK_DIR
   nohup bash simulate.sh >> /var/log/eda-simulate.log 2>&1 &
-  nohup python3 agent.py >> /var/log/eda-agent.log 2>&1 &
+  CW_LOG_GROUP='${log_group}' CW_LOG_STREAM='$INSTANCE_ID' \
+    nohup python3 agent.py >> /var/log/eda-agent.log 2>&1 &
 "
 
 log "부트스트랩 완료 — 시뮬레이션 및 에이전트 데몬 기동됨"
