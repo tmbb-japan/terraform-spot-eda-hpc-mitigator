@@ -3,14 +3,14 @@ output "vpc_id" {
   value       = aws_vpc.main.id
 }
 
-output "spot_instance_id" {
-  description = "스팟 인스턴스 요청에 의해 할당된 인스턴스 ID"
-  value       = aws_spot_instance_request.worker.spot_instance_id
+output "asg_name" {
+  description = "Auto Scaling Group 이름 (스팟 자동 복구)"
+  value       = aws_autoscaling_group.worker.name
 }
 
-output "spot_instance_public_ip" {
-  description = "스팟 인스턴스의 퍼블릭 IP (SSH 접속용)"
-  value       = aws_spot_instance_request.worker.public_ip
+output "launch_template_id" {
+  description = "Launch Template ID"
+  value       = aws_launch_template.worker.id
 }
 
 output "efs_id" {
@@ -26,6 +26,11 @@ output "efs_dns_name" {
 output "cloudwatch_log_group" {
   description = "에이전트 로그가 전송되는 CloudWatch Log Group"
   value       = aws_cloudwatch_log_group.agent.name
+}
+
+output "subnet_azs" {
+  description = "서브넷이 배포된 가용 영역 목록"
+  value       = aws_subnet.public[*].availability_zone
 }
 
 output "worker_iam_role_arn" {

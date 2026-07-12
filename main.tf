@@ -47,6 +47,10 @@ locals {
 # ==============================================================================
 # 1. 네트워크 인프라 (VPC, Subnet, IGW, Route Table)
 # ==============================================================================
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 resource "aws_vpc" "main" {
   cidr_block           = var.vpc_cidr
   enable_dns_hostnames = true
@@ -61,12 +65,14 @@ resource "aws_internet_gateway" "igw" {
 }
 
 resource "aws_subnet" "public" {
-  vpc_id                  = aws_vpc.main.id
-  cidr_block              = cidrsubnet(var.vpc_cidr, 8, 1) # 10.0.1.0/24
-  map_public_ip_on_launch = true
-  availability_zone       = "${var.aws_region}a"
+  count = min(length(data.aws_availability_zones.available.names), 3)
 
-  tags = { Name = "${local.name_prefix}-public-subnet" }
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, count.index + 1)
+  map_public_ip_on_launch = true
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+
+  tags = { Name = "${local.name_prefix}-public-${data.aws_availability_zones.available.names[count.index]}" }
 }
 
 resource "aws_route_table" "public" {
@@ -81,7 +87,9 @@ resource "aws_route_table" "public" {
 }
 
 resource "aws_route_table_association" "public" {
-  subnet_id      = aws_subnet.public.id
+  count = length(aws_subnet.public)
+
+  subnet_id      = aws_subnet.public[count.index].id
   route_table_id = aws_route_table.public.id
 }
 
@@ -206,8 +214,10 @@ resource "aws_efs_file_system" "shared_storage" {
 }
 
 resource "aws_efs_mount_target" "main" {
+  count = length(aws_subnet.public)
+
   file_system_id  = aws_efs_file_system.shared_storage.id
-  subnet_id       = aws_subnet.public.id
+  subnet_id       = aws_subnet.public[count.index].id
   security_groups = [aws_security_group.efs.id]
 }
 
@@ -221,7 +231,7 @@ resource "aws_cloudwatch_log_group" "agent" {
 }
 
 # ==============================================================================
-# 6. 컴퓨팅 (EC2 Spot Instance)
+# 6. 컴퓨팅 (Launch Template + Auto Scaling Group)
 # ==============================================================================
 data "aws_ami" "amazon_linux" {
   most_recent = true
@@ -238,18 +248,20 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
-resource "aws_spot_instance_request" "worker" {
-  ami                  = data.aws_ami.amazon_linux.id
-  instance_type        = var.instance_type
-  spot_type            = "one-time"
-  wait_for_fulfillment = true
-  spot_price           = var.spot_max_price != "" ? var.spot_max_price : null
+resource "aws_launch_template" "worker" {
+  name_prefix   = "${local.name_prefix}-worker-"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = var.instance_type
+  key_name      = var.key_pair_name != "" ? var.key_pair_name : null
 
-  subnet_id                   = aws_subnet.public.id
-  vpc_security_group_ids      = [aws_security_group.ec2.id]
-  iam_instance_profile        = aws_iam_instance_profile.worker.name
-  key_name                    = var.key_pair_name != "" ? var.key_pair_name : null
-  associate_public_ip_address = true
+  iam_instance_profile {
+    name = aws_iam_instance_profile.worker.name
+  }
+
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.ec2.id]
+  }
 
   # IMDSv2 강제 적용 (보안 필수)
   metadata_options {
@@ -258,16 +270,60 @@ resource "aws_spot_instance_request" "worker" {
     http_put_response_hop_limit = 2
   }
 
+  # 스팟 인스턴스 설정
+  instance_market_options {
+    market_type = "spot"
+
+    spot_options {
+      max_price                      = var.spot_max_price != "" ? var.spot_max_price : null
+      instance_interruption_behavior = "terminate"
+    }
+  }
+
   user_data = base64encode(templatefile("${path.module}/scripts/user_data.sh", {
-    efs_id          = aws_efs_file_system.shared_storage.id
-    log_group       = aws_cloudwatch_log_group.agent.name
-    project_name    = var.project_name
+    efs_id              = aws_efs_file_system.shared_storage.id
+    log_group           = aws_cloudwatch_log_group.agent.name
+    project_name        = var.project_name
     simulate_script     = file("${path.module}/scripts/simulate.sh")
     agent_script        = file("${path.module}/scripts/agent.py")
     manual_drain_script = file("${path.module}/scripts/manual_drain.sh")
   }))
 
-  tags = { Name = "${local.name_prefix}-spot-worker" }
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "${local.name_prefix}-spot-worker" }
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "worker" {
+  name                = "${local.name_prefix}-worker-asg"
+  desired_capacity    = 1
+  min_size            = 1
+  max_size            = 1
+  vpc_zone_identifier = aws_subnet.public[*].id
+
+  # 회수 후 새 인스턴스를 빠르게 기동
+  health_check_type         = "EC2"
+  health_check_grace_period = 120
+  default_cooldown          = 30
+
+  launch_template {
+    id      = aws_launch_template.worker.id
+    version = "$Latest"
+  }
+
+  # capacity rebalancing: 회수 전 대체 인스턴스를 미리 준비
+  capacity_rebalance = true
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name_prefix}-spot-worker"
+    propagate_at_launch = true
+  }
 
   depends_on = [aws_efs_mount_target.main]
 }

@@ -16,6 +16,31 @@ CURRENT_SUM=0
 CURRENT_NUM=1
 
 # ==============================================================================
+# Checkpoint Restore: EFS 백업에서 마지막 상태 복원
+# ==============================================================================
+restore_checkpoint() {
+    local latest
+    latest=$(ls -t "${BACKUP_DIR}"/progress_*.txt 2>/dev/null | head -1)
+
+    if [[ -z "$latest" ]]; then
+        echo "[$(date '+%F %T')] [RESTORE] 복원할 체크포인트 없음 — 처음부터 시작"
+        return
+    fi
+
+    local saved_num saved_sum
+    saved_num=$(grep '^current_number=' "$latest" | cut -d= -f2)
+    saved_sum=$(grep '^current_sum=' "$latest" | cut -d= -f2)
+
+    if [[ -n "$saved_num" && -n "$saved_sum" ]]; then
+        CURRENT_NUM=$((saved_num + 1))
+        CURRENT_SUM=$saved_sum
+        echo "[$(date '+%F %T')] [RESTORE] 체크포인트 복원 완료: num=${CURRENT_NUM} sum=${CURRENT_SUM} (from: $latest)"
+    else
+        echo "[$(date '+%F %T')] [RESTORE] 체크포인트 파싱 실패 — 처음부터 시작"
+    fi
+}
+
+# ==============================================================================
 # SIGTERM Handler: 상태 백업 후 정상 종료
 # ==============================================================================
 handle_sigterm() {
@@ -53,7 +78,8 @@ trap 'handle_sigterm' SIGTERM
 # ==============================================================================
 mkdir -p "${WORK_DIR}"
 echo $$ > "${PID_FILE}"
-echo "[$(date '+%F %T')] [START] 시뮬레이션 시작 (PID: $$)"
+restore_checkpoint
+echo "[$(date '+%F %T')] [START] 시뮬레이션 시작 (PID: $$, num=${CURRENT_NUM}, sum=${CURRENT_SUM})"
 echo "num=${CURRENT_NUM} sum=${CURRENT_SUM}" > "${PROGRESS_FILE}"
 
 # ==============================================================================
