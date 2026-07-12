@@ -66,6 +66,9 @@ handle_sigterm() {
         cp "${PROGRESS_FILE}" "${BACKUP_DIR}/last_progress.txt"
     fi
 
+    # 최근 2개를 제외한 오래된 백업 파일 정리
+    ls -t "${BACKUP_DIR}"/progress_*.txt 2>/dev/null | tail -n +3 | xargs -r rm -f
+
     echo "[$(date '+%F %T')] [DRAIN] 백업 완료: ${backup_file}"
     rm -f "${PID_FILE}"
     exit 0
